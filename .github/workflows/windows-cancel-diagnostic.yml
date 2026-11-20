@@ -1,0 +1,122 @@
+name: Windows cancellation diagnostics
+
+on:
+  push:
+    branches: [cjp/diagnose-pr1027-windows-cancel]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            algorithm/lazyllm/pyproject.toml
+            algorithm/requirements.txt
+            tests/algorithm/requirements-test.txt
+
+      - name: Read LazyLLM revision
+        id: lazyllm
+        run: echo "revision=$(git rev-parse HEAD:algorithm/lazyllm)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache LazyLLM wheel
+        uses: actions/cache@v4
+        id: lazyllm-wheel
+        with:
+          path: ${{ runner.temp }}/lazyllm-wheels
+          key: lazyllm-wheel-v1-${{ runner.os }}-${{ runner.arch }}-py${{ steps.python.outputs.python-version }}-${{ steps.lazyllm.outputs.revision }}
+
+      - uses: pandoc/actions/setup@v1
+        with:
+          version: '3.11'
+
+      - name: Install ripgrep
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            case "$RUNNER_OS" in
+              Linux) sudo apt-get update && sudo apt-get install -y ripgrep ;;
+              macOS) brew install ripgrep ;;
+              Windows)
+                # Chocolatey can return success after a transient feed error
+                # without installing anything. Verify the executable before
+                # accepting the result, and retry temporary download failures.
+                for attempt in 1 2 3; do
+                  if choco install ripgrep -y --no-progress && command -v rg >/dev/null 2>&1; then
+                    break
+                  fi
+                  if [ "$attempt" -lt 3 ]; then sleep "$((attempt * 5))"; fi
+                done
+                ;;
+            esac
+          fi
+          rg --version
+
+      - name: Build LazyLLM wheel
+        if: steps.lazyllm-wheel.outputs.cache-hit != 'true'
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+        run: python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/lazyllm-wheels" algorithm/lazyllm
+
+      - name: Install deps + coverage tools
+        shell: python
+        run: |
+          import importlib.util
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+
+          wheels = list((Path(os.environ['RUNNER_TEMP']) / 'lazyllm-wheels').glob('lazyllm-*.whl'))
+          if len(wheels) != 1:
+              raise RuntimeError(f'Expected one LazyLLM wheel, found {len(wheels)}')
+          subprocess.run([
+              sys.executable, '-m', 'pip', 'install', str(wheels[0]),
+              '-r', 'algorithm/requirements.txt', '-r', 'tests/algorithm/requirements-test.txt',
+              'scikit-build-core', 'pybind11', 'coverage', 'diff-cover',
+          ], check=True)
+          package = Path(importlib.util.find_spec('lazyllm').origin).parent
+          shutil.copy2('algorithm/lazyllm/pyproject.toml', package / 'pyproject.toml')
+
+      - name: Verify lazyllm install
+        run: |
+          python -c "from lazyllm.tools.agent.skill_manager import SkillManager; print('tools OK')"
+          python -c "from lazyllm.module import ModuleBase; print('module OK')"
+          python -c "from lazyllm import fc_register; print('fc_register OK')"
+
+      - name: Reproduce cancellation in algorithm CI order
+        shell: python
+        env:
+          LAZYLLM_INIT_DOC: "1"
+          PYTHONUTF8: "1"
+        run: |
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          report = Path(os.environ['RUNNER_TEMP']) / 'cancellation-probe.jsonl'
+          os.environ['CANCEL_PROBE_LOG'] = str(report)
+          command = ['-m', 'coverage', 'run', '--source=algorithm', '-m', 'pytest',
+                     'tests/algorithm/', '-v', '--durations=50']
+          try:
+              subprocess.run([sys.executable, *command], check=True)
+          finally:
+              if report.exists():
+                  for entry in report.read_text(encoding='utf-8').splitlines():
+                      print(f'CANCEL_PROBE {entry}', flush=True)

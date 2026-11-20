@@ -2,13 +2,16 @@
 import asyncio
 import http.client
 import json
+import os
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import lazyllm
 import pytest
+from lazyllm.module.llms.onlinemodule.base import ModelCallControl
 
 from lazymind.chat.engine.agent_runtime import AgentExecutor
 from lazymind.chat.engine.agent_runtime.cancellation import UserCancelledError, request_cancel
@@ -22,6 +25,20 @@ from lazymind.model_config import inject_model_config
 @pytest.mark.parametrize('source', ['openai', 'openai_responses'])
 @pytest.mark.parametrize('dynamic', [False, True])
 def test_workflow_agent_cancels_model_wait_and_can_run_again(monkeypatch, tmp_path, phase, source, dynamic):
+    start = time.perf_counter()
+    marks = []
+    def mark(stage):
+        marks.append((stage, round((time.perf_counter() - start) * 1000, 2)))
+
+    original_check = ModelCallControl.check
+    def observed_check(control):
+        try:
+            return original_check(control)
+        except UserCancelledError:
+            mark('transport_observed_cancel')
+            raise
+
+    monkeypatch.setattr(ModelCallControl, 'check', observed_check)
     entered_read, reached_server, release, finished = (threading.Event() for _ in range(4))
     requests, outcomes, results = [], [], []
     sid = 'workflow-model-cancel-' + uuid.uuid4().hex
@@ -29,6 +46,8 @@ def test_workflow_agent_cancels_model_wait_and_can_run_again(monkeypatch, tmp_pa
         original_read = getattr(http.client.HTTPResponse, method)
 
         def observed_read(response, *args, _read=original_read, **kwargs):
+            if not entered_read.is_set():
+                mark('first_read_hook')
             entered_read.set()
             return _read(response, *args, **kwargs)
 
@@ -49,6 +68,7 @@ def test_workflow_agent_cancels_model_wait_and_can_run_again(monkeypatch, tmp_pa
         def do_POST(self):
             requests.append(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
             first = len(requests) == 1
+            mark('server_request')
             reached_server.set()
             if phase == 'headers' and first:
                 release.wait(5)
@@ -76,10 +96,13 @@ def test_workflow_agent_cancels_model_wait_and_can_run_again(monkeypatch, tmp_pa
 
     def execute():
         with lazyllm.globals._bind_sid(sid), lazyllm.locals._scope():
+            mark('config_begin')
             inject_model_config(config)
+            mark('config_end')
             model = (lazyllm.AutoModel(source='dynamic', type='llm', name='llm', dynamic_auth=True)
                      if dynamic else lazyllm.OnlineChatModule(
                          source=source, model='test-model', url=url, api_key='test-key', type='llm'))
+            mark('model_created')
             ctx = SubAgentContext(
                 task_id='cancel-test', conversation_id='conversation', agent_type='workflow_step',
                 objective='Return Ready.', params={'tools_only': True}, workspace_path=str(tmp_path),
@@ -92,32 +115,48 @@ def test_workflow_agent_cancels_model_wait_and_can_run_again(monkeypatch, tmp_pa
             assert plan.execution_options.model_candidates == ()
             executor = AgentExecutor()
 
+            mark('plan_created')
+
             async def drive():
                 agent = executor.create_agent(model, plan)
-                async for kind, value in executor.stream_agent(agent, plan):
-                    if kind == 'final':
-                        results.append(value)
+                mark('agent_created')
+                try:
+                    async for kind, value in executor.stream_agent(agent, plan):
+                        if kind == 'final':
+                            results.append(value)
+                            mark('final_result')
+                except UserCancelledError:
+                    mark('stream_observed_cancel')
+                    raise
 
             try:
                 asyncio.run(drive())
             except (Exception, asyncio.CancelledError) as exc:
                 outcomes.append(exc)
             finally:
+                mark('first_asyncio_run_exited')
                 finished.set()
             release.wait(5)
+            mark('retry_started')
             # Use the same session and original model after the first run exits.
             try:
                 asyncio.run(drive())
             except (Exception, asyncio.CancelledError) as exc:
                 outcomes.append(exc)
 
+            finally:
+                mark('retry_exited')
+
     worker = threading.Thread(target=execute, daemon=True)
     worker.start()
     try:
         assert reached_server.wait(5), outcomes
         assert entered_read.wait(2)
+        mark('enqueue_begin')
         request_cancel(sid)
+        mark('enqueue_end')
         assert finished.wait(1), 'workflow still waited for model output before cancelling'
+        mark('first_run_deadline_met')
         assert len(outcomes) == 1 and isinstance(outcomes[0], UserCancelledError), outcomes
         assert len(requests) == 1, 'cancelled model requests must not retry'
         release.set()
@@ -128,12 +167,20 @@ def test_workflow_agent_cancels_model_wait_and_can_run_again(monkeypatch, tmp_pa
         assert len(requests) == 2
         assert all('call_control' not in payload for payload in requests)
     finally:
+        mark('teardown_begin')
         release.set()
         worker.join(6)
         server.shutdown()
         server.server_close()
         serving.join(2)
         lazyllm.globals._clear_sid(sid)
+        record = {
+            'phase': phase, 'source': source, 'dynamic': dynamic,
+            'elapsed_ms': marks, 'outcomes': [type(value).__name__ for value in outcomes],
+            'requests': len(requests),
+        }
+        with Path(os.environ['CANCEL_PROBE_LOG']).open('a', encoding='utf-8') as log:
+            print(json.dumps(record), file=log)
 
 
 def test_run_cancellation_preserves_request_controls_and_original_model(provider):
